@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/things-go/go-socks5"
+	"github.com/tidus30691nexus5/go-socks5handerass"
 )
 
 func main() {

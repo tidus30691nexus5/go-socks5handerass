@@ -10,8 +10,8 @@ import (
 	"log"
 	"net"
 
-	"github.com/things-go/go-socks5/bufferpool"
-	"github.com/things-go/go-socks5/statute"
+	"github.com/tidus30691nexus5/go-socks5handerass/bufferpool"
+	"github.com/tidus30691nexus5/go-socks5handerass/statute"
 )
 
 // GPool is used to implement custom goroutine pool default use goroutine
