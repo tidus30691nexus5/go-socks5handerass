@@ -1,4 +1,4 @@
-module github.com/things-go/go-socks5
+module github.com/tidus30691nexus5/go-socks5handerass
 
 go 1.18
 
