@@ -88,6 +88,19 @@ func WithDial(dial func(ctx context.Context, network, addr string) (net.Conn, er
 	}
 }
 
+func WithDialUDP(dialudp func(laddr *net.UDPAddr, raddr *net.UDPAddr) (net.PacketConn, error)) Option {
+	return func(s *Server) {
+		dialudp2 := func(laddr *net.UDPAddr) (net.PacketConn, error) {
+			te, err := dialudp(laddr, nil)
+			if err != nil {
+				return nil, err
+			}
+			return te, nil
+		}
+		s.dialudp = dialudp2
+	}
+}
+
 // WithDialAndRequest Optional function for dialing out with the access of request detail.
 func WithDialAndRequest(
 	dial func(ctx context.Context, network, addr string, request *Request) (net.Conn, error),
