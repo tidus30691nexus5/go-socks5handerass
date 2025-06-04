@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -146,7 +147,7 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 		}
 		return fmt.Errorf("connect to %v failed, %v", request.RawDestAddr, err)
 	}
-	defer target.Close() // nolint: errcheck
+	defer target.Close()
 
 	// Send success
 	if err := SendReply(writer, statute.RepSuccess, target.LocalAddr()); err != nil {
@@ -177,16 +178,36 @@ func (sf *Server) handleBind(_ context.Context, writer io.Writer, _ *Request) er
 	return nil
 }
 
+func udpAddrToByteArray(addr *net.UDPAddr) ([]byte, error) {
+	var result []byte
+
+	// starting 4 bytes
+	if addr.IP.To4() != nil {
+		result = append(result, 0, 0, 0, 1)
+		result = append(result, addr.IP.To4()...)
+	} else if addr.IP.To16() != nil {
+		result = append(result, 0, 0, 0, 4)
+		result = append(result, addr.IP.To16()...)
+	} else {
+		return nil, fmt.Errorf("unsupported IP address format")
+	}
+	// UDP port
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(addr.Port))
+	result = append(result, portBytes...)
+
+	return result, nil
+}
+
 // handleAssociate is used to handle a connect command
 func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request *Request) error {
-	// Attempt to connect
-	dial := sf.dial
-	if dial == nil {
-		dial = func(_ context.Context, net_, addr string) (net.Conn, error) {
-			return net.Dial(net_, addr)
+	dialudp := sf.dialudp
+	if dialudp == nil {
+		dialudp = func(laddr *net.UDPAddr) (net.PacketConn, error) {
+			return net.ListenUDP("udp", laddr)
 		}
 	}
-	bindLn, err := net.ListenUDP("udp", nil)
+	bindLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: request.LocalAddr.(*net.TCPAddr).IP, Port: 0})
 	if err != nil {
 		if err := SendReply(writer, statute.RepServerFailure, nil); err != nil {
 			return fmt.Errorf("failed to send reply, %v", err)
@@ -200,22 +221,18 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 		return fmt.Errorf("failed to send reply, %v", err)
 	}
 
+	outboundLn, _ := dialudp(&net.UDPAddr{
+		IP:   net.ParseIP("0.0.0.0"), //we can use any outgoing addr here
+		Port: 0,
+	})
 	sf.goFunc(func() {
-		// read from client and write to remote server
-		conns := sync.Map{}
+		addrToHost := sync.Map{} //store addr-to-host mapping (host is represented as "header" data structure)
 		bufPool := sf.bufferPool.Get()
 		defer func() {
 			sf.bufferPool.Put(bufPool)
-			bindLn.Close()// nolint: errcheck
-			conns.Range(func(key, value any) bool {
-				if connTarget, ok := value.(net.Conn); !ok {
-					sf.logger.Errorf("conns has illegal item %v:%v", key, value)
-				} else {
-					connTarget.Close()// nolint: errcheck
-				}
-				return true
-			})
+			bindLn.Close()
 		}()
+		flag := false
 		for {
 			n, srcAddr, err := bindLn.ReadFromUDP(bufPool[:cap(bufPool)])
 			if err != nil {
@@ -235,58 +252,48 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 				continue
 			}
 
-			connKey := srcAddr.String() + "--" + pk.DstAddr.String()
-
-			if target, ok := conns.Load(connKey); !ok {
-				// if the 'connection' doesn't exist, create one and store it
-				targetNew, err := dial(ctx, "udp", pk.DstAddr.String())
-				if err != nil {
-					sf.logger.Errorf("connect to %v failed, %v", pk.DstAddr, err)
-					// TODO:continue or return Error?
-					continue
-				}
-				conns.Store(connKey, targetNew)
-				// read from remote server and write to original client
-				sf.goFunc(func() {
-					bufPool := sf.bufferPool.Get()
-					defer func() {
-						targetNew.Close()// nolint: errcheck
-						conns.Delete(connKey)
-						sf.bufferPool.Put(bufPool)
-					}()
-
-					for {
-						buf := bufPool[:cap(bufPool)]
-						n, err := targetNew.Read(buf)
-						if err != nil {
-							if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-								return
-							}
-							sf.logger.Errorf("read data from remote %s failed, %v", targetNew.RemoteAddr().String(), err)
-							return
-						}
-						tmpBufPool := sf.bufferPool.Get()
-						proBuf := tmpBufPool
-						proBuf = append(proBuf, pk.Header()...)
-						proBuf = append(proBuf, buf[:n]...)
-						if _, err := bindLn.WriteTo(proBuf, srcAddr); err != nil {
-							sf.bufferPool.Put(tmpBufPool)
-							sf.logger.Errorf("write data to client %s failed, %v", srcAddr, err)
-							return
-						}
-						sf.bufferPool.Put(tmpBufPool)
-					}
-				})
-				if _, err := targetNew.Write(pk.Data); err != nil {
-					sf.logger.Errorf("write data to remote server %s failed, %v", targetNew.RemoteAddr().String(), err)
-					return
-				}
-			} else {
-				if _, err := target.(net.Conn).Write(pk.Data); err != nil {
-					sf.logger.Errorf("write data to remote server %s failed, %v", target.(net.Conn).RemoteAddr().String(), err)
-					return
-				}
+			DstIpAddr, err := net.ResolveUDPAddr("udp", pk.DstAddr.String())
+			if err != nil {
+				sf.logger.Errorf("resolveUdpAddr %v failed, %v", pk.DstAddr, err)
+				return
 			}
+			addrToHost.Store(DstIpAddr.String(), pk.Header()) //add (or update) addr-to-host mapping
+
+			if _, err := outboundLn.WriteTo(pk.Data, DstIpAddr); err != nil {
+				sf.logger.Errorf("write data to remote server %s failed, %v", DstIpAddr.String(), err)
+				return
+			}
+			//call only once
+			if flag {
+				continue
+			}
+			flag = true
+			sf.goFunc(func() {
+				responseBuf := sf.bufferPool.Get()
+				defer sf.bufferPool.Put(responseBuf)
+
+				for {
+					n, respAddr, err := outboundLn.ReadFrom(responseBuf[:cap(responseBuf)])
+					if err != nil {
+						if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+							return
+						}
+						sf.logger.Errorf("read data from remote via %s failed, %v", outboundLn.LocalAddr(), err)
+						return
+					}
+					//try to get header (possibly with domain name) from history
+					header, ok := addrToHost.Load(respAddr.String())
+					if !ok {
+						//packets from unknown peer; create header from the addr
+						header, _ = udpAddrToByteArray(respAddr.(*net.UDPAddr))
+					}
+					response := append(header.([]byte), responseBuf[:n]...)
+					if _, err := bindLn.WriteTo(response, srcAddr); err != nil {
+						sf.logger.Errorf("failed to send response to client %v: %v", srcAddr, err)
+						return
+					}
+				}
+			})
 		}
 	})
 
@@ -294,10 +301,9 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 	defer sf.bufferPool.Put(buf)
 
 	for {
+		// Read any additional data from the client (if necessary)
 		_, err := request.Reader.Read(buf[:cap(buf)])
-		// sf.logger.Errorf("read data from client %s, %d bytesm, err is %+v", request.RemoteAddr.String(), num, err)
 		if err != nil {
-			bindLn.Close()// nolint: errcheck
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
